@@ -1,0 +1,174 @@
+#version 430 core
+
+// 64 threads per workgroup block - highly optimized for 3D textures/grids
+layout (local_size_x = 4, local_size_y = 4, local_size_z = 4) in;
+
+// --- Shader Storage Buffer Objects (SSBOs) ---
+layout(std430, binding = 0) buffer DensityData {
+    float density[];
+};
+layout(std430, binding = 1) buffer TempDensityData {
+    float tempDensity[]; // Double-buffering to avoid read/write hazards
+};
+
+layout(std430, binding = 2) buffer VelocityData {
+    vec4 velocity[]; // vec4 for perfect std430 memory alignment (xyz = velocity, w = padding)
+};
+layout(std430, binding = 3) buffer TempVelocityData {
+    vec4 tempVelocity[];
+};
+
+layout(std430, binding = 4) buffer PressureData {
+    float pressure[];
+};
+layout(std430, binding = 5) buffer TempPressureData {
+    float tempPressure[];
+};
+layout(std430, binding = 6) buffer DivergenceData {
+    float divergence[];
+};
+
+// --- Uniforms ---
+uniform int NX = 32;
+uniform int NY = 48;
+uniform int NZ = 32;
+uniform float dt;
+uniform float dx = 0.25;
+uniform float viscosity = 0.01;
+uniform float dissipation = 0.995; // Controls how fast smoke naturally fades out
+
+uniform int mode; // 0: Advect, 1: Divergence, 2: Jacobi Pressure, 3: Project/Subtract
+
+// --- Helper Functions ---
+int getIdx(int x, int y, int z) {
+    // Clamp to boundaries to prevent accidental memory segmentation faults
+    x = clamp(x, 0, NX - 1);
+    y = clamp(y, 0, NY - 1);
+    z = clamp(z, 0, NZ - 1);
+    return x + y * NX + z * NX * NY;
+}
+
+// Trilinear interpolation for sampling smooth fluid values between cells
+vec4 sampleVelocity(vec3 pos) {
+    vec3 gridPos = pos / dx;
+    ivec3 iPos = ivec3(floor(gridPos));
+    vec3 f = fract(gridPos);
+
+    vec4 i000 = velocity[getIdx(iPos.x,     iPos.y,     iPos.z)];
+    vec4 i100 = velocity[getIdx(iPos.x + 1, iPos.y,     iPos.z)];
+    vec4 i010 = velocity[getIdx(iPos.x,     iPos.y + 1, iPos.z)];
+    vec4 i110 = velocity[getIdx(iPos.x + 1, iPos.y + 1, iPos.z)];
+    vec4 i001 = velocity[getIdx(iPos.x,     iPos.y,     iPos.z + 1)];
+    vec4 i101 = velocity[getIdx(iPos.x + 1, iPos.y,     iPos.z + 1)];
+    vec4 i011 = velocity[getIdx(iPos.x,     iPos.y + 1, iPos.z + 1)];
+    vec4 i111 = velocity[getIdx(iPos.x + 1, iPos.y + 1, iPos.z + 1)];
+
+    return mix(
+        mix(mix(i000, i100, f.x), mix(i010, i110, f.x), f.y),
+        mix(mix(i001, i101, f.x), mix(i011, i111, f.x), f.y),
+        f.z
+    );
+}
+
+float sampleDensity(vec3 pos) {
+    vec3 gridPos = pos / dx;
+    ivec3 iPos = ivec3(floor(gridPos));
+    vec3 f = fract(gridPos);
+
+    float i000 = density[getIdx(iPos.x,     iPos.y,     iPos.z)];
+    float i100 = density[getIdx(iPos.x + 1, iPos.y,     iPos.z)];
+    float i010 = density[getIdx(iPos.x,     iPos.y + 1, iPos.z)];
+    float i110 = density[getIdx(iPos.x + 1, iPos.y + 1, iPos.z)];
+    float i001 = density[getIdx(iPos.x,     iPos.y,     iPos.z + 1)];
+    float i101 = density[getIdx(iPos.x + 1, iPos.y,     iPos.z + 1)];
+    float i011 = density[getIdx(iPos.x,     iPos.y + 1, iPos.z + 1)];
+    float i111 = density[getIdx(iPos.x + 1, iPos.y + 1, iPos.z + 1)];
+
+    return mix(
+        mix(mix(i000, i100, f.x), mix(i010, i110, f.x), f.y),
+        mix(mix(i001, i101, f.x), mix(i011, i111, f.x), f.y),
+        f.z
+    );
+}
+
+void main() {
+    ivec3 id = ivec3(gl_GlobalInvocationID.xyz);
+
+    // Skip boundary cells to enforce zero-velocity wall containment easily
+    if (id.x >= NX - 1 || id.y >= NY - 1 || id.z >= NZ - 1 || id.x <= 0 || id.y <= 0 || id.z <= 0) {
+        return;
+    }
+
+    int idx = getIdx(id.x, id.y, id.z);
+    vec3 worldPos = vec3(id) * dx;
+
+    // =========================================================================
+    // MODE 0: SEMI-LAGRANGIAN ADVECTION (Density & Velocity tracing back in time)
+    // =========================================================================
+    if (mode == 0) {
+        vec3 vel = velocity[idx].xyz;
+        vec3 backtrackedPos = worldPos - (dt * vel);
+        
+        // Clamp backtracked positions safely inside simulation boundaries
+        vec3 minBound = vec3(dx * 0.5);
+        vec3 maxBound = vec3(float(NX - 1.5) * dx, float(NY - 1.5) * dx, float(NZ - 1.5) * dx);
+        backtrackedPos = clamp(backtrackedPos, minBound, maxBound);
+
+        // Write to temporary staging buffers to prevent race conditions
+        tempDensity[idx] = sampleDensity(backtrackedPos) * dissipation;
+        tempVelocity[idx] = sampleVelocity(backtrackedPos);
+        
+        // Apply upward buoyancy force based on smoke concentration
+        float buoyancy = 0.3;
+        tempVelocity[idx].y += tempDensity[idx] * buoyancy * dt;
+    }
+
+    // =========================================================================
+    // MODE 1: DIVERGENCE CALCULATION (Measuring net fluid flow differences)
+    // =========================================================================
+    else if (mode == 1) {
+        float velXRight = velocity[getIdx(id.x + 1, id.y, id.z)].x;
+        float velXLeft  = velocity[getIdx(id.x - 1, id.y, id.z)].x;
+        float velYUp    = velocity[getIdx(id.x, id.y + 1, id.z)].y;
+        float velYDown  = velocity[getIdx(id.x, id.y - 1, id.z)].y;
+        float velZBack  = velocity[getIdx(id.x, id.y, id.z + 1)].z;
+        float velZFront = velocity[getIdx(id.x, id.y, id.z - 1)].z;
+
+        divergence[idx] = -0.5 * dx * ((velXRight - velXLeft) + (velYUp - velYDown) + (velZBack - velZFront));
+        pressure[idx] = 0.0; // Clear pressure field cache before Jacobi pass
+    }
+
+    // =========================================================================
+    // MODE 2: JACOBI PRESSURE SOLVER (Relaxation cycles to satisfy continuity)
+    // =========================================================================
+    else if (mode == 2) {
+        float pXRight = pressure[getIdx(id.x + 1, id.y, id.z)];
+        float pXLeft  = pressure[getIdx(id.x - 1, id.y, id.z)];
+        float pYUp    = pressure[getIdx(id.x, id.y + 1, id.z)];
+        float pYDown  = pressure[getIdx(id.x, id.y - 1, id.z)];
+        float pZBack  = pressure[getIdx(id.x, id.y, id.z + 1)];
+        float pZFront = pressure[getIdx(id.x, id.y, id.z - 1)];
+
+        float div = divergence[idx];
+
+        // Solve Poisson Equation: 1/6 * (Neighbors sum - Divergence)
+        tempPressure[idx] = (pXRight + pXLeft + pYUp + pYDown + pZBack + pZFront + div) / 6.0;
+    }
+
+    // =========================================================================
+    // MODE 3: VELOCITY SUBTRACTION (Removing Divergence component)
+    // =========================================================================
+    else if (mode == 3) {
+        float pXRight = pressure[getIdx(id.x + 1, id.y, id.z)];
+        float pXLeft  = pressure[getIdx(id.x - 1, id.y, id.z)];
+        float pYUp    = pressure[getIdx(id.x, id.y + 1, id.z)];
+        float pYDown  = pressure[getIdx(id.x, id.y - 1, id.z)];
+        float pZBack  = pressure[getIdx(id.x, id.y, id.z + 1)];
+        float pZFront = pressure[getIdx(id.x, id.y, id.z - 1)];
+
+        // Compute pressure gradient forces
+        vec3 gradient = vec3(pXRight - pXLeft, pYUp - pYDown, pZBack - pZFront) * (0.5 / dx);
+        
+        velocity[idx].xyz -= gradient;
+    }
+}
